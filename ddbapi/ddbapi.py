@@ -21,7 +21,17 @@ def _term(field: str, value: str) -> str:
     return f'{field}:"{escaped}"'
 
 
-def _query(kind: str, query: dict) -> pd.DataFrame:
+def _validate_match(match: str) -> None:
+    if match not in ("all", "any"):
+        raise ValueError("match must be 'all' or 'any'")
+
+
+def _query(kind: str, query: dict, *, limit=None, fields=None, match="all", count=False):
+    if kind not in ("page", "issue"):
+        raise ValueError("kind must be 'page' or 'issue'")
+    _validate_match(match)
+    if limit is not None and (type(limit) is not int or limit < 0):
+        raise ValueError("limit must be a non-negative integer or None")
     allowed = _FIELDS | ({"plainpagefulltext"} if kind == "page" else set())
     clauses = [f"type:{kind}"]
     for field, value in query.items():
@@ -30,27 +40,46 @@ def _query(kind: str, query: dict) -> pd.DataFrame:
         if isinstance(value, list):
             if not value:
                 raise ValueError(f"{field} requires a non-empty list")
-            clauses.append("(" + " AND ".join(_term(field, item) for item in value) + ")")
+            operator = " AND " if match == "all" else " OR "
+            clauses.append("(" + operator.join(_term(field, item) for item in value) + ")")
         else:
             clauses.append(_term(field, value))
 
     params = {"rows": 1000, "sort": "id ASC", "q": " AND ".join(clauses),
               "cursorMark": "*", "wt": "json"}
+    if fields is not None:
+        if isinstance(fields, str):
+            fields = fields.split(",")
+        if not isinstance(fields, list) or not fields or any(
+                not isinstance(field, str) or not field.strip() for field in fields):
+            raise ValueError("fields must be a non-empty string or list of field names")
+        params["fl"] = ",".join(dict.fromkeys(["id", *(field.strip() for field in fields)]))
+    if count:
+        params["rows"] = 0
+        del params["cursorMark"]
+    elif limit == 0:
+        return pd.DataFrame()
     docs = []
     with requests.Session() as http:
         retry = Retry(total=3, status_forcelist=[429, 500, 502, 503, 504],
                       allowed_methods=["GET"], backoff_factor=1)
         http.mount("https://", HTTPAdapter(max_retries=retry))
         while True:
+            if not count and limit is not None:
+                params["rows"] = min(1000, limit - len(docs))
             response = http.get(API_URL, params=params, timeout=60)
             response.raise_for_status()
             result = response.json()
             if "error" in result:
                 raise ValueError(result["error"]["msg"])
+            if count:
+                return result["response"]["numFound"]
             batch = result["response"]["docs"]
+            if limit is not None:
+                batch = batch[:limit - len(docs)]
             docs.extend(batch)
             cursor = result["nextCursorMark"]
-            if not batch or cursor == params["cursorMark"]:
+            if not batch or cursor == params["cursorMark"] or (limit is not None and len(docs) >= limit):
                 break
             params["cursorMark"] = cursor
 
@@ -73,18 +102,23 @@ def _query(kind: str, query: dict) -> pd.DataFrame:
     return df
 
 
-def zp_issues(**query) -> pd.DataFrame:
+def zp_issues(*, limit=None, fields=None, match="all", **query) -> pd.DataFrame:
     """Fetch issues, combining filters with AND. Values may be strings or lists.
 
     Filters: language, place_of_distribution, publication_date, zdb_id,
     provider, paper_title. Publication dates accept Solr ranges [start TO end].
     """
-    return _query("issue", query)
+    return _query("issue", query, limit=limit, fields=fields, match=match)
 
 
-def zp_pages(**query) -> pd.DataFrame:
+def zp_pages(*, limit=None, fields=None, match="all", **query) -> pd.DataFrame:
     """Fetch pages. Supports issue filters plus plainpagefulltext."""
-    return _query("page", query)
+    return _query("page", query, limit=limit, fields=fields, match=match)
+
+
+def zp_count(*, kind="page", match="all", **query) -> int:
+    """Count matching pages (default) or issues without fetching documents."""
+    return _query(kind, query, match=match, count=True)
 
 
 def list_column(series: pd.Series) -> pd.Series:
@@ -92,7 +126,11 @@ def list_column(series: pd.Series) -> pd.Series:
     return pd.Series([x for values in series for x in values])
 
 
-def filter(searchfor: typing.Union[str, list], searchin: str, inframe: pd.DataFrame) -> pd.DataFrame:
+def filter(searchfor: typing.Union[str, list], searchin: str, inframe: pd.DataFrame, *, match="any") -> pd.DataFrame:
     """Filter list-containing columns; a search list matches any of its values."""
     values = searchfor if isinstance(searchfor, list) else [searchfor]
-    return inframe[inframe[searchin].apply(lambda row: any(value in row for value in values))]
+    _validate_match(match)
+    if not values or any(not isinstance(value, str) or not value.strip() for value in values):
+        raise ValueError("searchfor requires a non-empty string or list of strings")
+    combine = all if match == "all" else any
+    return inframe[inframe[searchin].apply(lambda row: combine(value in row for value in values))]

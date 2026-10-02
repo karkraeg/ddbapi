@@ -3,7 +3,7 @@ from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import requests
-from ddbapi import filter, list_column, zp_issues, zp_pages
+from ddbapi import filter, list_column, zp_count, zp_issues, zp_pages
 
 
 class QueryTests(unittest.TestCase):
@@ -48,6 +48,42 @@ class QueryTests(unittest.TestCase):
             with self.subTest(query=query), self.assertRaises(ValueError):
                 zp_issues(**query)
 
+    def test_count_uses_no_documents_or_cursor(self):
+        with patch("ddbapi.ddbapi.requests.Session") as session:
+            http = session.return_value.__enter__.return_value
+            http.get.return_value.json.return_value = {"response": {"numFound": 1234}}
+            self.assertEqual(zp_count(plainpagefulltext="Hochwasser"), 1234)
+            params = http.get.call_args.kwargs["params"]
+            self.assertEqual(params["rows"], 0)
+            self.assertNotIn("cursorMark", params)
+            self.assertIn("type:page", params["q"])
+
+    def test_limit_fields_and_any(self):
+        docs = [{"id": str(i)} for i in range(1000)]
+        df, seen = self.run_query(zp_pages, [(docs, "a"), ([{"id": "last"}], "b")],
+                                  limit=1001, fields=["paper_title"], match="any",
+                                  place_of_distribution=["Münster", "Bielefeld"])
+        self.assertEqual(len(df), 1001)
+        self.assertEqual([p["rows"] for p in seen], [1000, 1])
+        self.assertEqual(seen[0]["fl"], "id,paper_title")
+        self.assertIn('place_of_distribution:"Münster" OR place_of_distribution:"Bielefeld"', seen[0]["q"])
+        df, seen = self.run_query(zp_issues, [(docs[:2], "a")], limit=1, fields="id,paper_title")
+        self.assertEqual(len(df), 1)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0]["fl"], "id,paper_title")
+
+    def test_invalid_options_and_zero_limit(self):
+        with patch("ddbapi.ddbapi.requests.Session") as session:
+            self.assertTrue(zp_pages(limit=0).empty)
+            session.assert_not_called()
+            for options in ({"limit": -1}, {"limit": True}, {"limit": 1.5},
+                            {"fields": []}, {"fields": [42]}, {"match": "other"}):
+                with self.subTest(options=options), self.assertRaises(ValueError):
+                    zp_pages(**options)
+            with self.assertRaises(ValueError):
+                zp_count(kind="other")
+            session.assert_not_called()
+
     def test_http_errors_propagate(self):
         with patch("ddbapi.ddbapi.requests.Session") as session:
             session.return_value.__enter__.return_value.get.return_value.raise_for_status.side_effect = requests.HTTPError("503")
@@ -65,6 +101,10 @@ class QueryTests(unittest.TestCase):
         self.assertEqual(list_column(df.places).tolist(), ["A", "B", "C"])
         self.assertEqual(filter("A", "places", df).index.tolist(), [0])
         self.assertEqual(filter(["A", "C"], "places", df).index.tolist(), [0, 1])
+        self.assertEqual(filter(["A", "B"], "places", df, match="all").index.tolist(), [0])
+        self.assertEqual(filter(["A", "C"], "places", df, match="all").index.tolist(), [])
+        with self.assertRaises(ValueError):
+            filter("A", "places", df, match="other")
 
 
 if __name__ == "__main__":
