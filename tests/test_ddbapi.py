@@ -3,7 +3,8 @@ from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import requests
-from ddbapi import filter, list_column, zp_count, zp_issues, zp_pages
+from xml.etree import ElementTree as ET
+from ddbapi import filter, list_column, zp_alto, zp_count, zp_issues, zp_mets, zp_pages
 
 
 class QueryTests(unittest.TestCase):
@@ -105,6 +106,74 @@ class QueryTests(unittest.TestCase):
         self.assertEqual(filter(["A", "C"], "places", df, match="all").index.tolist(), [])
         with self.assertRaises(ValueError):
             filter("A", "places", df, match="other")
+
+
+class XmlTests(unittest.TestCase):
+    item_id = "NNTLPWFR4HBNAHVH3TC3KQH5S5Q7A7QN"
+    mets = b'''<record xmlns="http://www.openarchives.org/OAI/2.0/"
+        xmlns:mets="http://www.loc.gov/METS/" xmlns:xlink="http://www.w3.org/1999/xlink">
+        <metadata><mets:mets><mets:fileSec><mets:fileGrp USE="DDB_FULLTEXT">
+        <mets:file ID="other"><mets:FLocat xlink:href="https://example.org/wrong.xml"/></mets:file>
+        <mets:file ID="page-1"><mets:FLocat xlink:href="https://example.org/alto.xml"/></mets:file>
+        </mets:fileGrp></mets:fileSec></mets:mets></metadata></record>'''
+    alto = b'<alto xmlns="http://www.loc.gov/standards/alto/ns-v4#"/>'
+
+    def test_mets_preserves_source_bytes(self):
+        with patch("ddbapi.ddbapi.requests.Session") as session:
+            http = session.return_value.__enter__.return_value
+            http.get.return_value.content = self.mets
+            self.assertEqual(zp_mets(self.item_id), self.mets)
+            self.assertEqual(http.get.call_args.args[0],
+                             f"https://api.deutsche-digitale-bibliothek.de/2/items/{self.item_id}/source/record")
+            self.assertEqual(http.get.call_args.kwargs["headers"], {"Accept": "application/xml"})
+
+    def test_alto_resolves_exact_page(self):
+        with patch("ddbapi.ddbapi.requests.Session") as session:
+            http = session.return_value.__enter__.return_value
+            http.get.side_effect = [MagicMock(content=self.mets), MagicMock(content=self.alto)]
+            self.assertEqual(zp_alto(self.item_id + "-page-1"), self.alto)
+            self.assertEqual(http.get.call_args.args[0], "https://example.org/alto.xml")
+
+    def test_missing_page_and_invalid_url(self):
+        with patch("ddbapi.ddbapi.zp_mets", return_value=self.mets), patch("ddbapi.ddbapi.requests.Session") as session:
+            with self.assertRaisesRegex(ValueError, "No DDB_FULLTEXT"):
+                zp_alto(self.item_id + "-missing")
+            session.assert_not_called()
+        for href in (b"", b"file:///tmp/alto.xml"):
+            mets = self.mets.replace(b"https://example.org/alto.xml", href)
+            with patch("ddbapi.ddbapi.zp_mets", return_value=mets), self.assertRaises(ValueError):
+                zp_alto(self.item_id + "-page-1")
+
+    def test_invalid_ids_fail_before_network(self):
+        with patch("ddbapi.ddbapi.requests.Session") as session:
+            for item_id in (None, "", "../source", self.item_id.lower()):
+                with self.subTest(item_id=item_id), self.assertRaises(ValueError):
+                    zp_mets(item_id)
+            for page_id in (None, "", "bad-page", self.item_id + "-"):
+                with self.subTest(page_id=page_id), self.assertRaises(ValueError):
+                    zp_alto(page_id)
+            session.assert_not_called()
+
+    def test_xml_and_http_errors(self):
+        with patch("ddbapi.ddbapi.requests.Session") as session:
+            http = session.return_value.__enter__.return_value
+            http.get.return_value.content = b"<html/>"
+            with self.assertRaisesRegex(ValueError, "no METS"):
+                zp_mets(self.item_id)
+            http.get.return_value.content = b"invalid XML"
+            with self.assertRaises(ET.ParseError):
+                zp_mets(self.item_id)
+            http.get.return_value.raise_for_status.side_effect = requests.HTTPError("404")
+            with self.assertRaises(requests.HTTPError):
+                zp_mets(self.item_id)
+        with patch("ddbapi.ddbapi.zp_mets", return_value=self.mets), patch("ddbapi.ddbapi.requests.Session") as session:
+            http = session.return_value.__enter__.return_value
+            http.get.return_value.content = b"<html/>"
+            with self.assertRaisesRegex(ValueError, "no ALTO"):
+                zp_alto(self.item_id + "-page-1")
+            http.get.return_value.raise_for_status.side_effect = requests.HTTPError("404")
+            with self.assertRaises(requests.HTTPError):
+                zp_alto(self.item_id + "-page-1")
 
 
 if __name__ == "__main__":

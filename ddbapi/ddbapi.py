@@ -1,7 +1,10 @@
 """Query the public DDB newspaper index."""
 
 import typing
+import re
 from datetime import datetime
+from urllib.parse import urljoin, urlsplit
+from xml.etree import ElementTree as ET
 
 import pandas as pd
 import requests
@@ -10,6 +13,16 @@ from urllib3.util.retry import Retry
 
 API_URL = "https://api.deutsche-digitale-bibliothek.de/search/index/newspaper-issues/select"
 _FIELDS = {"language", "place_of_distribution", "publication_date", "zdb_id", "provider", "paper_title"}
+_METS_NS = {"mets": "http://www.loc.gov/METS/"}
+
+
+def _session() -> requests.Session:
+    http = requests.Session()
+    retry = Retry(total=3, status_forcelist=[429, 500, 502, 503, 504],
+                  allowed_methods=["GET"], backoff_factor=1)
+    http.mount("https://", HTTPAdapter(max_retries=retry))
+    http.mount("http://", HTTPAdapter(max_retries=retry))
+    return http
 
 
 def _term(field: str, value: str) -> str:
@@ -60,10 +73,7 @@ def _query(kind: str, query: dict, *, limit=None, fields=None, match="all", coun
     elif limit == 0:
         return pd.DataFrame()
     docs = []
-    with requests.Session() as http:
-        retry = Retry(total=3, status_forcelist=[429, 500, 502, 503, 504],
-                      allowed_methods=["GET"], backoff_factor=1)
-        http.mount("https://", HTTPAdapter(max_retries=retry))
+    with _session() as http:
         while True:
             if not count and limit is not None:
                 params["rows"] = min(1000, limit - len(docs))
@@ -119,6 +129,49 @@ def zp_pages(*, limit=None, fields=None, match="all", **query) -> pd.DataFrame:
 def zp_count(*, kind="page", match="all", **query) -> int:
     """Count matching pages (default) or issues without fetching documents."""
     return _query(kind, query, match=match, count=True)
+
+
+def zp_mets(ddb_item_id: str) -> bytes:
+    """Return the original METS source XML as bytes, possibly in an OAI wrapper."""
+    if not isinstance(ddb_item_id, str) or not re.fullmatch(r"[A-Z2-7]{32}", ddb_item_id):
+        raise ValueError("ddb_item_id must be a 32-character DDB item ID")
+    url = f"https://api.deutsche-digitale-bibliothek.de/2/items/{ddb_item_id}/source/record"
+    with _session() as http:
+        response = http.get(url, headers={"Accept": "application/xml"}, timeout=60)
+        response.raise_for_status()
+    root = ET.fromstring(response.content)
+    if root.tag != "{http://www.loc.gov/METS/}mets" and root.find(".//mets:mets", _METS_NS) is None:
+        raise ValueError("Source record contains no METS document")
+    return response.content
+
+
+def zp_alto(page_id: str) -> bytes:
+    """Resolve a page's DDB_FULLTEXT reference in METS and return ALTO XML bytes."""
+    if not isinstance(page_id, str) or "-" not in page_id:
+        raise ValueError("page_id must contain a DDB item ID and page name")
+    item_id, pagename = page_id.split("-", 1)
+    if not pagename:
+        raise ValueError("page_id requires a non-empty page name")
+    root = ET.fromstring(zp_mets(item_id))
+    for file in root.findall(".//mets:fileGrp[@USE='DDB_FULLTEXT']/mets:file", _METS_NS):
+        if file.get("ID") != pagename:
+            continue
+        location = file.find("mets:FLocat", _METS_NS)
+        href = location.get("{http://www.w3.org/1999/xlink}href") if location is not None else None
+        if not href:
+            raise ValueError(f"ALTO reference for {page_id} has no URL")
+        source_url = f"https://api.deutsche-digitale-bibliothek.de/2/items/{item_id}/source/record"
+        url = urljoin(source_url, href)
+        if urlsplit(url).scheme not in ("http", "https"):
+            raise ValueError("ALTO URL must use HTTP or HTTPS")
+        with _session() as http:
+            response = http.get(url, headers={"Accept": "application/xml"}, timeout=60)
+            response.raise_for_status()
+        alto = ET.fromstring(response.content)
+        if not alto.tag.startswith("{http://www.loc.gov/standards/alto/") or not alto.tag.endswith("}alto"):
+            raise ValueError("Fulltext reference returned no ALTO document")
+        return response.content
+    raise ValueError(f"No DDB_FULLTEXT reference for {page_id}")
 
 
 def list_column(series: pd.Series) -> pd.Series:

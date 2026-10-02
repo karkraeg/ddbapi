@@ -67,7 +67,6 @@ Count first, then download a bounded selection:
 from ddbapi import zp_count, zp_pages
 
 q = dict(plainpagefulltext="Hochwasser",
-         place_of_distribution="Münster",
          publication_date="[1900-01-01T12:00:00Z TO 1914-12-31T12:00:00Z]")
 print(zp_count(**q))  # Actual number of matching pages
 df = zp_pages(**q, limit=200, fields=["paper_title", "publication_date", "pagename"])
@@ -84,4 +83,29 @@ and `zp_count` accept `match="all"` (AND, default) or `match="any"` (OR).
 The DataFrame helper `filter()` accepts the same option; its default stays
 `"any"` for compatibility. Use an explicit `match` for consistent list semantics.
 
-See [this Notebook](https://deepnote.com/@karkraeg/Zeitungsportal-API-2SJN2o4mSzWm10DpUHsRUQ) for a usage example.
+## METS and ALTO
+
+`zp_mets(ddb_item_id)` returns the original source XML as `bytes`. The source may
+wrap the METS document in an OAI record. `zp_alto(page_id)` fetches that source,
+finds the page's file ID in the `DDB_FULLTEXT` group, and downloads its ALTO XML.
+Both functions raise HTTP errors, `ValueError` for missing documents or references,
+and `xml.etree.ElementTree.ParseError` for malformed XML.
+
+```python
+from pathlib import Path
+from ddbapi import zp_mets, zp_alto
+
+page = df.iloc[0]  # From the bounded query above; requires at least one match
+Path("issue.mets.xml").write_bytes(zp_mets(page.ddb_item_id))
+Path("page.alto.xml").write_bytes(zp_alto(page.page_id))
+```
+
+The source endpoint is `/2/items/{id}/source/record`; ALTO URLs come from METS,
+as shown in the DDB's [official workshop materials](https://github.com/Deutsche-Digitale-Bibliothek/ddblabs-summer-school-2024/blob/main/001b_Download_%C3%BCber_API_der_DDB.md).
+The implementation uses no API key. On 2026-10-02, both downloads worked without
+one for issue `2222Q5OHOAASI2H5YL2UIHPAMCTL7ZKD`, page
+`uuid-de5c8cf8-983b-45d0-bfd8-f0c1b9edb380_DDB_FULLTEXT`.
+Other source records may require authentication or lack a fulltext reference.
+Pages without a matching reference raise `ValueError`.
+
+See [this Notebook](https://deepnote.com/@karkraeg/Zeitungsportal-API-2SJN2o4mSzWm10DpUHsRUQ) for another usage example.
