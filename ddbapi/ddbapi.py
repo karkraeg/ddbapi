@@ -1,311 +1,98 @@
+"""Query the public DDB newspaper index."""
+
+import typing
+from datetime import datetime
+
+import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import typing
-from typing import overload
-import pandas as pd
 
-'''
-Karl Krägelin
-2021
-kraegelin@sub.uni-goettingen.de
-'''
+API_URL = "https://api.deutsche-digitale-bibliothek.de/search/index/newspaper-issues/select"
+_FIELDS = {"language", "place_of_distribution", "publication_date", "zdb_id", "provider", "paper_title"}
+
+
+def _term(field: str, value: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} requires a non-empty string")
+    if field == "publication_date" and value.startswith("[") and value.endswith("]"):
+        return f"{field}:{value}"
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'{field}:"{escaped}"'
+
+
+def _query(kind: str, query: dict) -> pd.DataFrame:
+    allowed = _FIELDS | ({"plainpagefulltext"} if kind == "page" else set())
+    clauses = [f"type:{kind}"]
+    for field, value in query.items():
+        if field not in allowed:
+            raise ValueError(f"{field} ist nicht erlaubt")
+        if isinstance(value, list):
+            if not value:
+                raise ValueError(f"{field} requires a non-empty list")
+            clauses.append("(" + " AND ".join(_term(field, item) for item in value) + ")")
+        else:
+            clauses.append(_term(field, value))
+
+    params = {"rows": 1000, "sort": "id ASC", "q": " AND ".join(clauses),
+              "cursorMark": "*", "wt": "json"}
+    docs = []
+    with requests.Session() as http:
+        retry = Retry(total=3, status_forcelist=[429, 500, 502, 503, 504],
+                      allowed_methods=["GET"], backoff_factor=1)
+        http.mount("https://", HTTPAdapter(max_retries=retry))
+        while True:
+            response = http.get(API_URL, params=params, timeout=60)
+            response.raise_for_status()
+            result = response.json()
+            if "error" in result:
+                raise ValueError(result["error"]["msg"])
+            batch = result["response"]["docs"]
+            docs.extend(batch)
+            cursor = result["nextCursorMark"]
+            if not batch or cursor == params["cursorMark"]:
+                break
+            params["cursorMark"] = cursor
+
+    df = pd.DataFrame(docs)
+    if not df.empty:
+        df.rename(columns={"id": "page_id" if kind == "page" else "ddb_item_id"}, inplace=True)
+        if kind == "page" and "pagename" in df:
+            df["ddb_item_id"] = [
+                page_id.removesuffix("-" + pagename) if isinstance(pagename, str) else None
+                for page_id, pagename in zip(df["page_id"], df["pagename"])
+            ]
+        if "publication_date" in df:
+            # Seconds support historical dates outside pandas' nanosecond range.
+            df["publication_date"] = pd.Series(
+                [datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ") if pd.notna(value) else pd.NaT
+                 for value in df["publication_date"]],
+                index=df.index, dtype="datetime64[s]",
+            )
+    print(f"Got {len(df)} items.")
+    return df
+
 
 def zp_issues(**query) -> pd.DataFrame:
-    """Call DDB API, return a Dataframe Object.
+    """Fetch issues, combining filters with AND. Values may be strings or lists.
 
-    Keyword arguments:
-
-    - `language`
-    - `place_of_distribution`
-    - `publication_date`
-    - `zdb_id`
-    - `provider`
-    - `paper_title`
-
-    Keyword arguments can contain lists.
-
+    Filters: language, place_of_distribution, publication_date, zdb_id,
+    provider, paper_title. Publication dates accept Solr ranges [start TO end].
     """
-
-    def setup_requests() -> requests.Session:
-        """Sets up a requests session to automatically retry on errors
-
-        cf. <https://findwork.dev/blog/advanced-usage-python-requests-timeouts-retries-hooks/>
-
-        Returns
-        -------
-        http : requests.Session
-            A fully configured requests Session object
-        """
-        http = requests.Session()
-        assert_status_hook = (
-            lambda response, *args, **kwargs: response.raise_for_status()
-        )
-        http.hooks["response"] = [assert_status_hook]
-        retry_strategy = Retry(
-            total=3,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET"],
-            backoff_factor=1,
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        http.mount("https://", adapter)
-        http.mount("http://", adapter)
-        return http
-
-    http = setup_requests()
-
-    API_URL = "https://api.deutsche-digitale-bibliothek.de/search/index/newspaper-issues/select"
-    # Construct Parameters for HTTP Query
-
-    params = dict()
-    params["rows"] = 1000
-    params["sort"] = "id ASC"
-
-    q = ["type:issue"]
-    allowed_kwargs = ['language', 'place_of_distribution', 'publication_date', 'zdb_id', 'provider', 'paper_title']
-    querytuples = [(k, query[k]) for k in query]
-    for field, value in querytuples:
-        if field not in allowed_kwargs:
-            raise Exception(f"{field} ist nicht erlaubt")
-        if field == "publication_date":
-            # publication_date before 1677
-            try:
-                if int(value[1:5:1]) <= 1677:
-                    problematic_Timestamp = True
-                else:
-                    problematic_Timestamp = False
-            except:
-                pass
-        else:
-            problematic_Timestamp = False
-
-        if isinstance(value, list):
-            # parameter has multiple values
-            subq = []
-            for i in value:
-                i = i.replace(" ", "\ ")
-                subq.append(f"{field}:{i}")
-            q.append("(" + " AND ".join(subq) + ")")
-        else:
-            # parameter has only one value, not a list
-            if field != "issue":
-                value = value.replace(" ", "\ ")
-                q.append(f'{field}:"{value}"')
-
-    params["q"] = " AND ".join(q)
-    params["cursorMark"] = "*"
-    # Gettin the data
-    try:
-        http.get(API_URL, params=params)
-    except Exception as e:
-        return e
-    else:
-        print(http.get(API_URL, params=params).request.url)
-        docs = []
-        if http.get(API_URL, params=params).json()["response"]["numFound"] >= 1000:
-            # if we have to iterate over the responses
-            numFound = http.get(API_URL, params=params).json()["response"]["numFound"]
-            while True:
-                apireturn = http.get(API_URL, params=params).json()
-                cursormark = apireturn["nextCursorMark"]
-                params["cursorMark"] = cursormark
-                if len(apireturn["response"]["docs"]) != 0:
-                    docs.extend(apireturn["response"]["docs"])
-                    print(f"Getting {len(docs)} of {numFound}")
-                else:
-                    break
-        else:
-            # if the return fits on one page
-            response = http.get(API_URL, params=params).json()["response"]["docs"]
-            if len(response) != 0:
-                docs.extend(http.get(API_URL, params=params).json()["response"]["docs"])
-            else:
-                pass
-        # construct Dataframe from List of returned documents
-        df = pd.DataFrame(docs)
-        print(f"Got {len(df)} items.")
-        if len(df) != 0:
-
-            df.rename(columns = {'id':'ddb_item_id'}, inplace = True)
-
-            if problematic_Timestamp == False:
-                # If Timestamp ist after 1677, pandas can convert the column into a datetime object.
-                # See https://pandas.pydata.org/docs/user_guide/timeseries.html#timestamp-limitations
-                df["publication_date"] = pd.to_datetime(
-                    df["publication_date"], format="%Y-%m-%dT%H:%M:%SZ"
-                )
-            else:
-                # otherwise transform data to python datetime type
-                import datetime as dt
-
-                df["publication_date"] = df["publication_date"].apply(
-                    lambda x: dt.datetime.strptime(x, "%Y-%m-%dT%H:%M:%SZ")
-                    if type(x) == str
-                    else pd.NaT
-                )
-        else:
-            pass
-        return df
+    return _query("issue", query)
 
 
 def zp_pages(**query) -> pd.DataFrame:
-    """Call DDB API, return a Dataframe Object.
-
-    Keyword arguments:
-
-    - 'plainpagefulltext`
-    - `language`
-    - `place_of_distribution`
-    - `publication_date`
-    - `zdb_id`
-    - `provider`
-    - `paper_title`
-
-    Keyword arguments can contain lists.
-
-    """
-
-    def setup_requests() -> requests.Session:
-        """Sets up a requests session to automatically retry on errors
-
-        cf. <https://findwork.dev/blog/advanced-usage-python-requests-timeouts-retries-hooks/>
-
-        Returns
-        -------
-        http : requests.Session
-            A fully configured requests Session object
-        """
-        http = requests.Session()
-        assert_status_hook = (
-            lambda response, *args, **kwargs: response.raise_for_status()
-        )
-        http.hooks["response"] = [assert_status_hook]
-        retry_strategy = Retry(
-            total=3,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET"],
-            backoff_factor=1,
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        http.mount("https://", adapter)
-        http.mount("http://", adapter)
-        return http
-
-    http = setup_requests()
-
-    API_URL = "https://api.deutsche-digitale-bibliothek.de/search/index/newspaper-issues/select"
-    # Construct Parameters for HTTP Query
-
-    params = dict()
-    params["rows"] = 1000
-    params["sort"] = "id ASC"
-
-    q = ["type:page"]
-    allowed_kwargs = ['plainpagefulltext', 'language', 'place_of_distribution', 'publication_date', 'zdb_id', 'provider', 'paper_title']
-    querytuples = [(k, query[k]) for k in query]
-    for field, value in querytuples:
-        if field not in allowed_kwargs:
-            raise Exception(f"{field} ist nicht erlaubt")
-        if field == "publication_date":
-            # publication_date before 1677
-            try:
-                if int(value[1:5:1]) <= 1677:
-                    problematic_Timestamp = True
-                else:
-                    problematic_Timestamp = False
-            except:
-                pass
-        else:
-            problematic_Timestamp = False
-
-        if isinstance(value, list):
-            # parameter has multiple values
-            subq = []
-            for i in value:
-                i = i.replace(" ", "\ ")
-                subq.append(f"{field}:{i}")
-            q.append("(" + " AND ".join(subq) + ")")
-        else:
-            # parameter has only one value, not a list
-            if field != "issue":
-                value = value.replace(" ", "\ ")
-                q.append(f'{field}:"{value}"')
-
-    params["q"] = " AND ".join(q)
-    params["cursorMark"] = "*"
-    # Gettin the data
-    try:
-        http.get(API_URL, params=params)
-    except Exception as e:
-        return e
-    else:
-        print(http.get(API_URL, params=params).request.url)
-        docs = []
-        if http.get(API_URL, params=params).json()["response"]["numFound"] >= 1000:
-            # if we have to iterate over the responses
-            numFound = http.get(API_URL, params=params).json()["response"]["numFound"]
-            while True:
-                apireturn = http.get(API_URL, params=params).json()
-                cursormark = apireturn["nextCursorMark"]
-                params["cursorMark"] = cursormark
-                if len(apireturn["response"]["docs"]) != 0:
-                    docs.extend(apireturn["response"]["docs"])
-                    print(f"Getting {len(docs)} of {numFound}")
-                else:
-                    break
-        else:
-            # if the return fits on one page
-            response = http.get(API_URL, params=params).json()["response"]["docs"]
-            if len(response) != 0:
-                docs.extend(http.get(API_URL, params=params).json()["response"]["docs"])
-            else:
-                pass
-        # construct Dataframe from List of returned documents
-        df = pd.DataFrame(docs)
-        print(f"Got {len(df)} items.")
-        if len(df) != 0:
-            df.rename(columns={'id': 'page_id'}, inplace=True)
-            try:
-                # try to extract DDB Item ID, needs pagename
-                df["ddb_item_id"] = df.apply(
-                    lambda row: row.id.replace("-" + row.pagename, ""), axis=1
-                )
-            except:
-                pass
-
-            if problematic_Timestamp == False:
-                # If Timestamp ist after 1677, pandas can convert the column into a datetime object.
-                # See https://pandas.pydata.org/docs/user_guide/timeseries.html#timestamp-limitations
-                df["publication_date"] = pd.to_datetime(
-                    df["publication_date"], format="%Y-%m-%dT%H:%M:%SZ"
-                )
-            else:
-                # otherwise transform data to python datetime type
-                import datetime as dt
-
-                df["publication_date"] = df["publication_date"].apply(
-                    lambda x: dt.datetime.strptime(x, "%Y-%m-%dT%H:%M:%SZ")
-                    if type(x) == str
-                    else pd.NaT
-                )
-        else:
-            pass
-        return df
+    """Fetch pages. Supports issue filters plus plainpagefulltext."""
+    return _query("page", query)
 
 
 def list_column(series: pd.Series) -> pd.Series:
-    '''Convert a list-containing column to a 2D array thus allowing us to apply typical pandas functions again'''
-    return pd.Series([x for _list in series for x in _list])
+    """Flatten a column containing lists for ordinary pandas operations."""
+    return pd.Series([x for values in series for x in values])
 
 
 def filter(searchfor: typing.Union[str, list], searchin: str, inframe: pd.DataFrame) -> pd.DataFrame:
-    '''
-    Search for a string or a list of strings inside columns containing lists of Pandas DataFrames. Returns a new, filtered DataFrame.
-    '''
-    if isinstance(searchfor, list):
-        msk = inframe[searchin].apply(lambda row: any(i for i in searchfor if i in row))
-        return inframe[msk]
-    else:
-        mask = inframe[searchin].apply(lambda row: searchfor in row)
-        return inframe[mask]
+    """Filter list-containing columns; a search list matches any of its values."""
+    values = searchfor if isinstance(searchfor, list) else [searchfor]
+    return inframe[inframe[searchin].apply(lambda row: any(value in row for value in values))]

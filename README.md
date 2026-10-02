@@ -3,6 +3,25 @@
 - Query the DDB API for Newspapers
 - returns a Pandas Dataframe Object
 
+## Installation and development
+
+Requires Python 3.10 or newer and [uv](https://docs.astral.sh/uv/).
+
+```sh
+uv sync
+uv run python -m unittest discover -s tests -v
+```
+
+Run scripts using `uv run python your_script.py`. Dependencies are pinned in
+`uv.lock`; update them with `uv lock --upgrade` followed by `uv sync`.
+
+Both query functions fetch all matching records using cursor pagination. Use
+narrow filters for live queries: the index contains millions of records.
+HTTP/network errors are raised; invalid filters raise `ValueError`.
+Date ranges are sent as Solr ranges. Returned dates use `datetime64[s]`, including
+dates before 1677. Page results contain both `page_id` and `ddb_item_id` when
+`pagename` is available.
+
 Usage:
 
 ```

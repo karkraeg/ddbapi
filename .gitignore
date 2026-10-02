@@ -5,3 +5,6 @@ ddbapi.egg-info
 test/
 .DS_Store
 *.pyc
+.venv/
+__pycache__/
+build/
